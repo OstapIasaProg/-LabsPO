@@ -1,0 +1,143 @@
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <random>
+#include <algorithm>
+#include <iomanip>
+#include <future>
+#include <windows.h> 
+
+using namespace std;
+using namespace std::chrono;
+
+using Matrix = vector<vector<int>>;
+
+Matrix generateMatrix(size_t N) {
+    Matrix matrix(N, vector<int>(N));
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> dist(1, 1000);
+
+    for (size_t i = 0; i < N; ++i) {
+        for (size_t j = 0; j < N; ++j) {
+            matrix[i][j] = dist(gen);
+        }
+    }
+    return matrix;
+}
+
+// Індекс побічної діагоналі для рядка i розраховується як: (i, N - 1 - i)
+void processRows(Matrix& matrix, size_t startRow, size_t endRow) {
+    size_t N = matrix.size();
+    for (size_t i = startRow; i < endRow; ++i) {
+
+        int minVal = matrix[i][0];
+        for (size_t j = 1; j < N; ++j) {
+            if (matrix[i][j] < minVal) {
+                minVal = matrix[i][j];
+            }
+        }
+
+        matrix[i][N - 1 - i] = minVal;
+    }
+}
+
+// Функція для послідовного виконання 
+double runSequential(Matrix matrix) {
+    auto start = high_resolution_clock::now();
+
+
+    processRows(matrix, 0, matrix.size());
+
+    auto end = high_resolution_clock::now();
+    return duration_cast<duration<double>>(end - start).count();
+}
+
+// Функція для паралельного виконання
+double runParallel(Matrix matrix, int numThreads) {
+    auto start = high_resolution_clock::now();
+
+    size_t N = matrix.size();
+    vector<thread> threads;
+
+    size_t rowsPerThread = N / numThreads;
+    size_t remainder = N % numThreads;
+
+    size_t startRow = 0;
+    for (int t = 0; t < numThreads; ++t) {
+
+        size_t endRow = startRow + rowsPerThread + (t < remainder ? 1 : 0);
+
+        threads.emplace_back(processRows, ref(matrix), startRow, endRow);
+
+        startRow = endRow;
+    }
+
+
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
+
+    auto end = high_resolution_clock::now();
+    return duration_cast<duration<double>>(end - start).count();
+}
+
+int main() {
+
+    SetConsoleOutputCP(1251);
+    SetConsoleCP(1251);
+
+
+    unsigned int logicalCores = thread::hardware_concurrency();
+    unsigned int physicalCores = logicalCores / 2;
+    if (physicalCores == 0) physicalCores = 1;
+
+    cout << "Виявлено логічних ядер: " << logicalCores << endl;
+    cout << "Оцінка фізичних ядер: " << physicalCores << endl;
+
+
+    vector<int> threadCounts = {
+        (int)physicalCores / 2,
+        (int)physicalCores,
+        (int)logicalCores,
+        (int)logicalCores * 2,
+        (int)logicalCores * 4,
+        (int)logicalCores * 8,
+        (int)logicalCores * 16
+    };
+
+    sort(threadCounts.begin(), threadCounts.end());
+    threadCounts.erase(unique(threadCounts.begin(), threadCounts.end()), threadCounts.end());
+    if (threadCounts[0] == 0) threadCounts[0] = 1;
+
+
+    vector<size_t> sizes = { 100, 200, 1000, 2000, 5000, 10000, 20000 };
+
+    cout << fixed << setprecision(5);
+
+    for (size_t N : sizes) {
+        cout << "\n Тестування матриці розміром: " << N << " x " << N << endl;
+
+        Matrix originalMatrix = generateMatrix(N);
+
+
+        double seqTime = runSequential(originalMatrix);
+        cout << "Час послідовного виконання: " << seqTime << " сек" << endl;
+
+        cout << "| Потоки  | Час (сек)  | Прискорення (Посл./Парал.) |" << endl;
+
+
+        for (int threads : threadCounts) {
+
+            double parTime = runParallel(originalMatrix, threads);
+            double speedup = seqTime / parTime;
+
+            cout << "| " << setw(7) << threads
+                << " | " << setw(10) << parTime
+                << " | " << setw(26) << speedup << " |" << endl;
+        }
+    }
+
+    return 0;
+}
