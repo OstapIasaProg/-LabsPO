@@ -1,0 +1,154 @@
+#include <iostream>
+#include <vector>
+#include <numeric>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <random>
+#include <functional>
+#include <iomanip> 
+#include <windows.h>
+
+using namespace std;
+
+unsigned int result_seq = 0;
+unsigned int result_mutex = 0;
+atomic<unsigned int> result_atomic(0);
+
+mutex mtx;
+
+// Послідовний алгоритм
+void task_sequential(const vector<int>& data, int limit) {
+    result_seq = 0;
+    for (int i = 0; i < limit; ++i) {
+        if (data[i] % 9 == 0) {
+            result_seq ^= data[i];
+        }
+    }
+}
+
+// Блокуючий алгоритм (М'ютекс)
+void worker_mutex(const vector<int>& data, int start, int end) {
+    unsigned int local_result = 0; 
+
+    for (int i = start; i < end; ++i) {
+        if (data[i] % 9 == 0) {
+            local_result ^= data[i];
+        }
+    }
+
+    lock_guard<mutex> lock(mtx);
+    result_mutex ^= local_result;
+}
+
+void task_blocking(const vector<int>& data, int limit, int num_threads) {
+    result_mutex = 0;
+    vector<thread> threads;
+    int chunk_size = limit / num_threads;
+
+    for (int i = 0; i < num_threads; ++i) {
+        int start = i * chunk_size;
+        int end = (i == num_threads - 1) ? limit : (i + 1) * chunk_size;
+        threads.emplace_back(worker_mutex, ref(data), start, end);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
+// Неблокуючий алгоритм (Atomic CAS) 
+
+void worker_atomic(const vector<int>& data, int start, int end) {
+    unsigned int local_result = 0;
+
+    for (int i = start; i < end; ++i) {
+        if (data[i] % 9 == 0) {
+            local_result ^= data[i]; 
+        }
+    }
+
+    unsigned int old_val = result_atomic.load(memory_order_relaxed);
+    unsigned int new_val;
+    do {
+        new_val = old_val ^ local_result;
+    } while (!result_atomic.compare_exchange_weak(old_val, new_val,
+        memory_order_relaxed,
+        memory_order_relaxed));
+
+}
+
+void task_non_blocking(const vector<int>& data, int limit, int num_threads) {
+    result_atomic.store(0);
+    vector<thread> threads;
+    int chunk_size = limit / num_threads;
+
+    for (int i = 0; i < num_threads; ++i) {
+        int start = i * chunk_size;
+        int end = (i == num_threads - 1) ? limit : (i + 1) * chunk_size;
+        threads.emplace_back(worker_atomic, ref(data), start, end);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
+int main() 
+{
+
+    SetConsoleOutputCP(1251);
+    SetConsoleCP(1251);
+
+    vector<int> data_counts = { 10000, 1000000, 20000000, 200000000, 1000000000 };
+    vector<int> thread_counts = { 1, 6, 12, 24, 48, 96, 192 };
+
+    int max_size = 1000000000;
+
+    vector<int> data(max_size);
+    mt19937 gen(42);
+    uniform_int_distribution<> dis(1, 1000);
+    for (auto& x : data) x = dis(gen);
+
+    cout << left << setw(12) << "Дані"
+        << setw(8) << "Потоки"
+        << setw(16) << "Послідовний"
+        << setw(16) << "М'ютекс"
+        << setw(16) << "Атомарний"
+        << setw(12) << "Результат" << endl; 
+    cout << string(85, '-') << endl;
+
+    for (int n : data_counts) {
+
+        // Послідовний розрахунок 
+        auto start = chrono::high_resolution_clock::now();
+        task_sequential(data, n);
+        auto end = chrono::high_resolution_clock::now();
+        chrono::duration<double> duration_seq = end - start;
+
+        for (int t : thread_counts) {
+            // М'ютекс
+            start = chrono::high_resolution_clock::now();
+            task_blocking(data, n, t);
+            end = chrono::high_resolution_clock::now();
+            chrono::duration<double> duration_mutex = end - start;
+
+            // Atomic
+            start = chrono::high_resolution_clock::now();
+            task_non_blocking(data, n, t);
+            end = chrono::high_resolution_clock::now();
+            chrono::duration<double> duration_atomic = end - start;
+
+            cout << left << setw(12) << n
+                << setw(8) << t
+                << setw(16) << fixed << setprecision(6) << duration_seq.count()
+                << setw(16) << duration_mutex.count()
+                << setw(16) << duration_atomic.count()
+                << setw(12) << result_atomic.load() << endl; 
+        }
+        cout << string(85, '-') << endl;
+    }
+
+    return 0;
+}
