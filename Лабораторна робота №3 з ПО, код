@@ -1,0 +1,226 @@
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <chrono>
+#include <random>
+#include <iomanip>
+#include <windows.h> 
+
+using namespace std;
+
+mutex cout_mtx;
+mutex metrics_mtx;
+
+// Структура задачі
+struct Task {
+    int id;
+    int duration;
+    function<void()> work;
+    chrono::steady_clock::time_point created_at;
+};
+
+// Структура для збору статистики виконання
+struct Stats {
+    int created = 0;
+    int completed = 0;
+    int rejected = 0;
+    long long total_exec_time = 0;
+    long long total_wait_time = 0;
+    long long sum_queue_len = 0;
+    int samples_count = 0;
+} stats;
+
+class ThreadPool {
+    struct QueueGroup {
+        queue<Task> tasks;
+        int current_load = 0;
+        mutex mtx;
+        condition_variable cv;
+        vector<thread> workers;
+    };
+
+    QueueGroup queues[2];
+    bool stop_flag = false;
+    bool pause_flag = false;
+
+public:
+    ThreadPool() {
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                queues[i].workers.emplace_back(&ThreadPool::worker_loop, this, i);
+            }
+        }
+    }
+
+    ~ThreadPool() {
+        stop();
+    }
+
+    // Додавання нової задачі
+    void add_task(int id, int duration, function<void()> work) {
+        {
+            lock_guard<mutex> lock(metrics_mtx);
+            stats.created++;
+        }
+
+        Task new_task = { id, duration, work, chrono::steady_clock::now() };
+
+        // Вибір черги з найменшим навантаженням 
+        int load0, load1;
+        { lock_guard<mutex> lk(queues[0].mtx); load0 = queues[0].current_load; }
+        { lock_guard<mutex> lk(queues[1].mtx); load1 = queues[1].current_load; }
+
+        int target_idx = (load0 <= load1) ? 0 : 1;
+
+        {
+            unique_lock<mutex> lock(queues[target_idx].mtx);
+
+            if (queues[target_idx].current_load + duration > 45) {
+                {
+                    lock_guard<mutex> lk(cout_mtx);
+                    cout << ">>> Задача " << id << " (" << duration << "с) ВІДХИЛЕНА! Переповнення черги." << endl;
+                }
+
+                lock_guard<mutex> m_lock(metrics_mtx);
+                stats.rejected++;
+                return;
+            }
+
+            queues[target_idx].tasks.push(new_task);
+            queues[target_idx].current_load += duration;
+
+            {
+                lock_guard<mutex> m_lock(metrics_mtx);
+                stats.sum_queue_len += queues[target_idx].tasks.size();
+                stats.samples_count++;
+            }
+        }
+        queues[target_idx].cv.notify_one();
+    }
+
+    void pause() {
+        pause_flag = true;
+    }
+
+    void resume() {
+        pause_flag = false;
+        for (auto& q : queues) q.cv.notify_all();
+    }
+
+    void stop() {
+        if (stop_flag) return;
+        stop_flag = true;
+        resume();
+
+        for (auto& q : queues) {
+            q.cv.notify_all();
+            for (auto& w : q.workers) {
+                if (w.joinable()) w.join();
+            }
+        }
+    }
+
+private:
+    // Головний цикл робочого потоку
+    void worker_loop(int q_idx) {
+        while (true) {
+            Task task;
+            {
+                unique_lock<mutex> lock(queues[q_idx].mtx);
+
+                queues[q_idx].cv.wait(lock, [&] {
+                    return (!queues[q_idx].tasks.empty() && !pause_flag) || stop_flag;
+                    });
+
+                if (stop_flag && queues[q_idx].tasks.empty()) return;
+                if (pause_flag) continue;
+
+                task = queues[q_idx].tasks.front();
+                queues[q_idx].tasks.pop();
+                queues[q_idx].current_load -= task.duration;
+            }
+
+            {
+                lock_guard<mutex> lk(cout_mtx);
+                cout << "Задача " << task.id << " розпочата, тривалість: " << task.duration << " секунд." << endl;
+            }
+
+            auto start_t = chrono::steady_clock::now();
+            task.work();
+            auto end_t = chrono::steady_clock::now();
+            long long exec_ms = chrono::duration_cast<chrono::milliseconds>(end_t - start_t).count();
+
+            {
+                lock_guard<mutex> lk(cout_mtx);
+                cout << "Задача " << task.id << " завершена." << endl;
+            }
+
+            {
+                lock_guard<mutex> m_lock(metrics_mtx);
+                stats.completed++;
+                stats.total_exec_time += exec_ms;
+            }
+        }
+    }
+};
+
+
+
+// Функція-генератор задач 
+void producer(ThreadPool& pool, int start_id, int count) {
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> dist(4, 10);
+
+    for (int i = 0; i < count; ++i) {
+        int duration = dist(gen);
+        pool.add_task(start_id + i, duration, [duration]() {
+            this_thread::sleep_for(chrono::seconds(duration));
+            });
+        this_thread::sleep_for(chrono::milliseconds(400));
+    }
+}
+
+int main()
+{
+    SetConsoleOutputCP(1251);
+    SetConsoleCP(1251);
+
+    ThreadPool pool;
+
+    thread t1(producer, ref(pool), 0, 6);
+    thread t2(producer, ref(pool), 10, 6);
+    thread t3(producer, ref(pool), 20, 6);
+
+    this_thread::sleep_for(chrono::seconds(8));
+
+    // Тест паузи
+    pool.pause();
+    { lock_guard<mutex> lk(cout_mtx); cout << "\nПАУЗА (3 сек)\n" << endl; }
+
+    this_thread::sleep_for(chrono::seconds(3));
+
+    { lock_guard<mutex> lk(cout_mtx); cout << "ВІДНОВЛЕННЯ\n" << endl; }
+    pool.resume();
+
+    t1.join(); t2.join(); t3.join();
+
+    this_thread::sleep_for(chrono::seconds(5));
+    pool.stop();
+
+    double avg_q = stats.samples_count > 0 ? (double)stats.sum_queue_len / stats.samples_count : 0;
+    double avg_exec = stats.completed > 0 ? (double)stats.total_exec_time / stats.completed / 1000.0 : 0;
+
+    cout << "\nВсього задач створено: " << stats.created << endl;
+    cout << "Всього задач виконано: " << stats.completed << endl;
+    cout << "Відхилено задач (>45с): " << stats.rejected << endl;
+    cout << "Середня довжина черги: " << (int)avg_q << endl;
+    cout << "Середній час виконання задач: " << fixed << setprecision(5) << avg_exec << " с" << endl;
+    cout << "\nПроцес завершено з кодом 0" << endl;
+
+    return 0;
+}
